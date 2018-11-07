@@ -16,7 +16,10 @@ import org.apache.commons.io.IOUtils;
 
 import java.io.File;
 import java.io.IOException;
+import java.text.MessageFormat;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static com.thoughtworks.go.plugin.api.response.DefaultGoPluginApiResponse.badRequest;
 
@@ -97,6 +100,7 @@ public class YamlConfigPlugin implements GoPlugin {
             File baseDir = new File(directory);
 
             String pattern = null;
+            Permissions permissions = Permissions.ALLOW_EVERYTHING;
             JsonArray perRepoConfig = parsedResponseObject.getAsJsonArray("configurations");
             if(perRepoConfig != null) {
                 for(JsonElement config : perRepoConfig) {
@@ -104,8 +108,9 @@ public class YamlConfigPlugin implements GoPlugin {
                     String key = configObj.getAsJsonPrimitive("key").getAsString();
                     if(key.equals(PLUGIN_SETTINGS_FILE_PATTERN)) {
                         pattern = configObj.getAsJsonPrimitive("value").getAsString();
-                    }
-                    else
+                    } else if (key.equals("permissions")) {
+                        permissions = new Permissions(configObj.getAsJsonPrimitive("value").getAsString());
+                    } else
                         return badRequest("Config repo configuration has invalid key=" + key);
                 }
             }
@@ -121,8 +126,15 @@ public class YamlConfigPlugin implements GoPlugin {
 
             String[] files = scanner.getFilesMatchingPattern(baseDir, pattern);
             JsonConfigCollection config = parser.parseFiles(baseDir, files);
-
             config.updateTargetVersionFromFiles();
+
+            PermissionsResult result = permissions.applyTo(config);
+            if (!result.isAllowed()) {
+                JsonConfigCollection errorResponse = new JsonConfigCollection();
+                errorResponse.addError(new PluginError(result.reason(), "YAML config plugin"));
+                return DefaultGoPluginApiResponse.error(gson.toJson(errorResponse.getJsonObject()));
+            }
+
             JsonObject responseJsonObject = config.getJsonObject();
 
             return DefaultGoPluginApiResponse.success(gson.toJson(responseJsonObject));
@@ -229,5 +241,79 @@ public class YamlConfigPlugin implements GoPlugin {
                 return json;
             }
         };
+    }
+
+    private static class Permissions {
+        final static Pattern PATTERN = Pattern.compile("pipeline_groups:([^;]*);environments:(.*)");
+        final static Permissions ALLOW_EVERYTHING = new Permissions("pipeline_groups:.*;environments:.*");
+
+        private final List<String> allowedPipelineGroupPatterns;
+        private final List<String> allowedEnvironmentPatterns;
+
+        Permissions(String permissionsValue) {
+            Matcher matcher = PATTERN.matcher(permissionsValue);
+            if (!matcher.find()) {
+                throw new RuntimeException("Pattern not matched: Pattern = " + PATTERN + ", Value: " + permissionsValue);
+            }
+            this.allowedPipelineGroupPatterns = Arrays.asList(matcher.group(1).split(","));
+            this.allowedEnvironmentPatterns = Arrays.asList(matcher.group(2).split(","));
+        }
+
+        PermissionsResult applyTo(JsonConfigCollection newSetOfChanges) {
+            Set<String> groupsAffected = getField(newSetOfChanges.getPipelines(), "group");
+            Set<String> environmentsAffected = getField(newSetOfChanges.getEnvironments(), "name");
+
+            Set<String> disallowedEnvironments = findDisallowed(environmentsAffected, allowedEnvironmentPatterns);
+            Set<String> disallowedPipelineGroups = findDisallowed(groupsAffected, allowedPipelineGroupPatterns);
+
+            if (disallowedEnvironments.isEmpty() && disallowedPipelineGroups.isEmpty()) {
+                return new PermissionsResult(true, "Permission checks were successful");
+            }
+            return new PermissionsResult(false,
+                    MessageFormat.format("Permission denied. This repo is not allowed to affect these groups: [{0}] and these environments: [{1}]",
+                            String.join(", ", disallowedPipelineGroups), String.join(", ", disallowedEnvironments)));
+        }
+
+        private Set<String> findDisallowed(Set<String> entitiesAffected, List<String> allowedEntityPatterns) {
+            HashSet<String> validEntities = new HashSet<>();
+
+            for (String entity : entitiesAffected) {
+                for (String allowedEntityPattern : allowedEntityPatterns) {
+                    if (entity.matches(allowedEntityPattern)) {
+                        validEntities.add(entity);
+                    }
+                }
+            }
+
+            HashSet<String> result = new HashSet<>(entitiesAffected);
+            result.removeAll(validEntities);
+            return result;
+        }
+
+        private Set<String> getField(JsonArray elements, String keyNameOfElement) {
+            Set<String> result = new HashSet<>();
+            for (JsonElement element : elements) {
+                result.add(element.getAsJsonObject().get(keyNameOfElement).getAsString());
+            }
+            return result;
+        }
+    }
+
+    private static class PermissionsResult {
+        private final boolean isAllowed;
+        private final String reason;
+
+        PermissionsResult(boolean isAllowed, String reason) {
+            this.isAllowed = isAllowed;
+            this.reason = reason;
+        }
+
+        boolean isAllowed() {
+            return isAllowed;
+        }
+
+        String reason() {
+            return reason;
+        }
     }
 }
